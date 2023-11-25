@@ -1,0 +1,186 @@
+#!/usr/bin/bash
+
+# ------------------------------------------------------------------------------
+# EB - THE INSTALLER
+# ------------------------------------------------------------------------------
+# Please set the related environment variables in CONFIG file or in the shell to
+# customize the installation process.
+#
+# Examples:
+#    export USE_LOCAL_TEMPLATES=true
+#    export DONT_CLONE_GIT_REPO=true
+#    export DONT_RUN_HOST=true
+#    export BRIDGE="br0"
+# ------------------------------------------------------------------------------
+export BASEDIR=$(pwd)
+
+# The first argument is the template name and we need it.
+if [[ -z "$1" ]]; then
+    echo "ERROR: missing argument. The template name is required"
+    echo "Usage:"
+    echo "         bash eb <TEMPLATE_NAME>"
+    exit 1
+fi
+
+export TAG="eb"
+export BASE_TEMPLATE="$TAG-base"
+export BASE_CONFIG="${BASE_TEMPLATE}.conf"
+export BASE_REPO="https://github.com/emrahcom/bookworm-lxc-base.git"
+export APP_TEMPLATE="$(echo $1 | sed 's/\.conf$//')"
+export APP_CONFIG="${APP_TEMPLATE}.conf"
+export LOGGER="https://checkmyport.emrah.com"
+
+[[ -e "$BASEDIR/$APP_CONFIG" ]] && source "$BASEDIR/$APP_CONFIG"
+
+[[ -z "$BASE_BRANCH" ]] && export BASE_BRANCH="main"
+[[ -z "$BASE_TMP_DIR" ]] && export BASE_TMP_DIR="/tmp/$TAG-base"
+[[ -z "$APP_REPO" ]] && export APP_REPO=
+[[ -z "$APP_BRANCH" ]] && export APP_BRANCH="main"
+[[ -z "$APP_TMP_DIR" ]] && export APP_TMP_DIR="/tmp/$TAG"
+
+[[ -z "$USE_LOCAL_TEMPLATES" ]] && export USE_LOCAL_TEMPLATES=false
+[[ -z "$LOCAL_TEMPLATES" ]] && \
+    export LOCAL_TEMPLATES="/root/$TAG-local-templates"
+
+[[ -z "$BRIDGE" ]] && export BRIDGE="$TAG"
+[[ -z "$SHARED" ]] && export SHARED="/usr/local/$TAG"
+[[ -z "$RELEASE" ]] && export RELEASE="bookworm"
+[[ -z "$FREE_SPACE_NEEDED" ]] && export FREE_SPACE_NEEDED=1000000
+
+# ------------------------------------------------------------------------------
+# STATUS
+# ------------------------------------------------------------------------------
+export START_TIME=$(date +%s)
+export DATE=$(date +"%Y%m%d%H%M%S")
+export SWAP=$(grep SwapTotal /proc/meminfo | awk '{ print $2; }')
+export FREE_SPACE=$((df | grep "/var/lib/lxc$"
+    df | grep "/var/lib$"
+    df | grep "/var$"
+    df | egrep "/$") | \
+    head -n1 | awk '{ print $4; }')
+
+# ------------------------------------------------------------------------------
+# CHECKING THE HOST (which will host the LXC containers)
+# ------------------------------------------------------------------------------
+# If the current user is not 'root', cancel the installation.
+if [[ "root" != "$(whoami)" ]]; then
+    echo
+    echo "ERROR: unauthorized user"
+    echo "Please, run the installation script as 'root'"
+    exit 1
+fi
+
+# If the OS release is unsupported, cancel the installation.
+if [[ "$DONT_CHECK_OS_RELEASE" != true ]] && \
+   [[ -z "$(grep "$RELEASE" /etc/os-release)" ]]; then
+    echo
+    echo "ERROR: unsupported OS release"
+    echo "Please, use '$RELEASE' on host machine"
+    exit 1
+fi
+
+# If there is not enough disk free space, cancel the installation.
+if [[ "$DONT_CHECK_FREE_SPACE" != true ]] && \
+   [[ "$FREE_SPACE" -lt "$FREE_SPACE_NEEDED" ]]; then
+    echo
+    echo "ERROR: there is not enough disk free space"
+    echo
+    df -h
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# trap on exit
+# ------------------------------------------------------------------------------
+set -e
+
+function on_exit {
+if [[ "$COMPLETED" != true ]]; then
+    echo -e "\nSomething went wrong. The installation couldn't be completed!"
+    exit 1
+fi
+
+exit 0
+}
+
+COMPLETED=false
+trap on_exit EXIT
+
+# ------------------------------------------------------------------------------
+# BASE PACKAGES
+# ------------------------------------------------------------------------------
+apt-get $APT_PROXY update
+apt-get $APT_PROXY -y install wget curl rsync
+apt-get $APT_PROXY -y install dnsutils
+apt-get $APT_PROXY -y install git
+
+curl -sf "$LOGGER/?text=$APP_TEMPLATE-started" || true
+
+# ------------------------------------------------------------------------------
+# CLONING THE GIT REPO
+# ------------------------------------------------------------------------------
+if [[ "$DONT_CLONE_GIT_REPO" != true ]]; then
+    rm -rf $BASE_TMP_DIR
+    git clone --depth=1 -b $BASE_BRANCH $BASE_REPO $BASE_TMP_DIR
+    rm -rf $BASE_TMP_DIR/{.git,.gitignore}
+
+    rm -rf $APP_TMP_DIR
+    if [[ -n "$APP_REPO" ]]; then
+        if [[ -n "$(echo $APP_REPO | egrep -o '^ssh://')" ]]; then
+            git clone --depth=1 -b $APP_BRANCH $APP_REPO $APP_TMP_DIR \
+                --config core.sshCommand="ssh \
+                    -i /root/.ssh/deploy.key \
+                    -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null"
+        else
+            git clone --depth=1 -b $APP_BRANCH $APP_REPO $APP_TMP_DIR
+        fi
+
+        rm -rf $APP_TMP_DIR/{.git,.gitignore}
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# MERGE THE BASE FOLDER WITH THE APPLICATION FOLDER
+# ------------------------------------------------------------------------------
+if [[ "$BASE_TEMPLATE" != "$APP_TEMPLATE" ]]; then
+    rsync -av $APP_TMP_DIR/ $BASE_TMP_DIR/
+    rm -rf $APP_TMP_DIR
+fi
+
+mv $BASE_TMP_DIR $APP_TMP_DIR
+
+# ------------------------------------------------------------------------------
+# MERGE THE LOCAL TEMPLATES FOLDER WITH THE APPLICATION FOLDER
+# ------------------------------------------------------------------------------
+if [[ "$USE_LOCAL_TEMPLATES" = true ]] && \
+   [[ -d "$LOCAL_TEMPLATES" ]]; then
+    rsync -av $LOCAL_TEMPLATES/ $APP_TMP_DIR/
+fi
+
+# ------------------------------------------------------------------------------
+# RUNNING THE SUB INSTALLATION SCRIPTS
+# ------------------------------------------------------------------------------
+export TMP="$APP_TMP_DIR"
+export INSTALLER="$APP_TMP_DIR/installer-sub-scripts/$APP_TEMPLATE"
+export MACHINES="$APP_TMP_DIR/machines"
+export MACHINE_HOST="$MACHINES/$TAG-host"
+export MACHINE_BOOKWORM="$MACHINES/$TAG-bookworm"
+export MACHINE_COMMON="$MACHINES/common"
+
+cd $INSTALLER
+[[ -f "init.sh" ]] && bash init.sh
+
+for sub in $(ls *.sh | grep -v init.sh); do
+    bash $sub
+done
+
+# ------------------------------------------------------------------------------
+# INSTALLATION DURATION
+# ------------------------------------------------------------------------------
+END_TIME=$(date +%s)
+DURATION=$(date -u -d "0 $END_TIME seconds - $START_TIME seconds" +"%H:%M:%S")
+COMPLETED=true
+
+echo Installation Duration: $DURATION
+curl -sf "$LOGGER/?text=$APP_TEMPLATE-completed-$DURATION" || true
