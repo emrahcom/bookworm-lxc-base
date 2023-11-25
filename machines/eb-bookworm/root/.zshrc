@@ -1,0 +1,1 @@
+../../common/home/user/.zshrc.red
