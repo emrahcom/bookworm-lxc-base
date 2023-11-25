@@ -1,0 +1,6 @@
+[Match]
+Name=eth0
+
+[Network]
+Address=___IP___/24
+Gateway=___GATEWAY___
